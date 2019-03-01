@@ -31,23 +31,49 @@ rm -rf /tmp/example1.socket
 firecracker --api-sock /tmp/example1.socket
 ```
 
-In the other window run the commands below to configure the image.
+Run this command to set the linux kernel image.
 ```
-curl --unix-socket /tmp/example1.socket -H 'Accept: application/json' -H 'Content-Type: application/json' -i -X PUT http://localhost/boot-source -d '{ "kernel_image_path": "./vmlinuz", "boot_args": "console=ttyS0 reboot=k panic=1 pci=off" }'
-
-curl --unix-socket /tmp/icecream.socket -H 'Accept: application/json' -H 'Content-Type: application/json' -i -X PUT http://localhost/network-interfaces/1 -d '{ "iface_id": "1", "host_dev_name": "example1" }'
-
-curl --unix-socket /tmp/icecream.socket -H 'Accept: application/json' -H 'Content-Type: application/json' -i -X PUT http://localhost/drives/rootfs -d '{ "drive_id": "rootfs", "path_on_host": "./rootfs.ext4", "is_root_device": true, "is_read_only": false }'
-
-curl --unix-socket /tmp/icecream.socket -H 'Accept: application/json' -H 'Content-Type: application/json' -i -X PUT http://localhost/machine-config -d '{ "vcpu_count":1, "mem_size_mib":1024 }'
+curl --unix-socket /tmp/example1.socket \
+  -H 'Accept: application/json' \
+  -H 'Content-Type: application/json' \
+  -i -X PUT http://localhost/boot-source \
+  -d '{ "kernel_image_path": "./vmlinuz", "boot_args": "console=ttyS0 reboot=k panic=1 pci=off" }'
 ```
-Then run the command below to add the interface to the system bridge.
+Run this command to add a single interface.
+```
+curl --unix-socket /tmp/example1.socket \
+  -H 'Accept: application/json' \
+  -H 'Content-Type: application/json' \
+  -i -X PUT http://localhost/network-interfaces/1 \
+  -d '{ "iface_id": "1", "host_dev_name": "example1" }'
+```
+Run this command to bind the interface we just created to the linux bridge br0.
 ```
 brctl addif br0 example1 && ifconfig example1 up
 ```
-Now boot the system with the command.
+Run this coomand to set the roofs (the file we just created)
 ```
-curl --unix-socket /tmp/icecream.socket -H 'Accept: application/json' -H 'Content-Type: application/json' -i -X PUT http://localhost/actions -d '{ "action_type": "InstanceStart" }'
+curl --unix-socket /tmp/example1.socket 
+  -H 'Accept: application/json' \
+  -H 'Content-Type: application/json' \
+  -i -X PUT http://localhost/drives/rootfs \
+  -d '{ "drive_id": "rootfs", "path_on_host": "./rootfs.ext4", "is_root_device": true, "is_read_only": false }'
+```
+Run this command to set the memory.
+```
+curl --unix-socket /tmp/example1.socket \
+  -H 'Accept: application/json' \
+  -H 'Content-Type: application/json' \
+  -i -X PUT http://localhost/machine-config \
+  -d '{ "vcpu_count":1, "mem_size_mib":1024 }'
+```
+Finally run this command to boot the system.
+```
+curl --unix-socket /tmp/example1.socket \
+  -H 'Accept: application/json' \
+  -H 'Content-Type: application/json' \
+  -i -X PUT http://localhost/actions \
+  -d '{ "action_type": "InstanceStart" }'
 ```
 
 
