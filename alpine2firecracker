@@ -1,76 +1,152 @@
-#!/bin/sh -e
+#!/bin/sh
 
-export SIZE=200M
+export SIZE=20
+
+LOG=build.log
+
+EXIT_CODE=1
 
 main() {
-	[[ $FIRECRACKER_STAGE ]] && { $FIRECRACKER_STAGE; return $?; }
-	container=$1
-	[[ $container ]] || { err "Usage: $0 container (eg. jodydadescott/myfire:latest)"; return 2; }
-	docker run --privileged -e FIRECRACKER_STAGE=stage1 -v $(PWD):/mnt -it $container sh /mnt/$(basename $0)
-}
 
-stage1() {
-	# This stage runs inside the target container
-	err "Running stage1"
-	tmp=$(mktemp -d)
-	cd $tmp || return 2
+	cat /dev/null > $LOG
+	[ -f /sbin/apk ] || { err "Must run inside alpine container"; return 2; }
+	finish() {
+		[ $EXIT_CODE -eq 0 ] && { err "Build Successful"; } || { err "Build Failed, see $LOG for more detail"; }
+	}
+	trap finish EXIT
+
+	err "Installing base packages"
+	run apk add alpine-base blkid syslinux util-linux e2fsprogs || return 2
+
+	err "Enabling base servcies"
+	# Firecracker will use console ttyS0
+	run ln -s /etc/init.d/agetty /etc/init.d/agetty.ttyS0 || return 2
+
+	# Configure these services to start on boot
+	run ln -s /etc/init.d/devfs  /etc/runlevels/boot || return 2
+	run ln -s /etc/init.d/hostname /etc/runlevels/boot || return 2
+	run ln -s /etc/init.d/procfs /etc/runlevels/boot || return 2
+	run ln -s /etc/init.d/sysfs  /etc/runlevels/boot || return 2
+	# run ln -s /etc/init.d/syslog /etc/runlevels/boot || return 2
+
+	# Configure these service to start on default
+	run ln -s /etc/init.d/agetty.ttyS0 /etc/runlevels/default || return 2
+
+	err "Configuring /etc/securetty"
+	cat /etc/securetty | grep -v console | grep -v ttyS0  > /tmp/securetty
+	echo "console" > /etc/securetty
+	echo "ttyS0" >> /etc/securetty
+	run cp /tmp/securetty /etc/securetty || return 2
+	rm /tmp/securetty
+
+	# Create a temp root (tmproot), install required packages, and setup
+	# mounts to the container root. This allows us to install packages
+	# into that we need for the build without installing them in the target
+	# container. We will need to bindmount the container root, proc, sys and
+	# dev into tmproot so that we can chroot into tmproot and perform the
+	# build.
+
+	err "Building temporary root with required packages"
+	tmp=/.firecracker
 	tmproot=$tmp/tmproot
 	newroot=$tmp/newroot
-	mkdir -p $tmproot/realroot $tmproot/mnt || return 2
+	run mkdir -p $tmproot/realroot $tmproot/mnt || return 2
 
-	# Install minimum required packages
-	apk add alpine-base blkid syslinux util-linux e2fsprogs || return 2
+	run mkdir -p $tmproot/etc/apk || return 2
+	run cp -r /etc/apk/keys ${tmproot}/etc/apk || return 2
+	run install -D /etc/apk/repositories ${tmproot}/etc/apk/repositories || return 2
+	run apk add --root $tmproot --initdb --quiet || return 2
+	run apk add --root $tmproot --quiet alpine-base rsync qemu-img e2fsprogs bc || return 2
 
-	ln -s /etc/init.d/agetty /etc/init.d/agetty.ttyS0 || return 2
-	ln -s /etc/init.d/devfs  /etc/runlevels/boot || return 2
-	ln -s /etc/init.d/hostname /etc/runlevels/boot || return 2
-	ln -s /etc/init.d/procfs /etc/runlevels/boot || return 2
-	ln -s /etc/init.d/sysfs  /etc/runlevels/boot || return 2
-	ln -s /etc/init.d/syslog /etc/runlevels/boot || return 2
-	ln -s /etc/init.d/agetty.ttyS0 /etc/runlevels/default || return 2
+	run mount --bind / $tmproot/realroot || return 2
+	run mount --bind /proc $tmproot/proc || return 2
+	run mount --bind /sys $tmproot/sys || return 2
+	run mount --bind /dev $tmproot/dev || return 2
 
-	mkdir -p $tmproot/etc/apk || return 2
-	cp -r /etc/apk/keys ${tmproot}/etc/apk || return 2
-	install -D /etc/apk/repositories ${tmproot}/etc/apk/repositories || return 2
-	apk add --root $tmproot --initdb --quiet || return 2
-	apk add --root $tmproot --quiet alpine-base rsync qemu-img e2fsprogs || return 2
+	# Write a build script into tmproot then chroot and execute the script.
+	local disk=/${tmp}/disk
+	local rootfs=/${tmp}/rootfs.ext4
 
-	mount --bind / $tmproot/realroot || return 2
-	mount --bind /mnt $tmproot/mnt || return 2
-	mount --bind /proc $tmproot/proc || return 2
-	mount --bind /sys $tmproot/sys || return 2
-	mount --bind /dev $tmproot/dev || return 2
+	cat > ${tmproot}/build<<-EOF
+	mkdir -p /realroot${disk} || exit 2
 
-	export FIRECRACKER_STAGE=stage2
-	chroot $tmproot sh /mnt/$(basename $0) || return 2
+	rsync -a  /realroot/ /realroot/${disk} \
+		--exclude .firecracker/ \
+		--exclude tmp/ \
+		--exclude mnt/ \
+		--exclude proc/ \
+		--exclude boot/ \
+		--exclude sys/ \
+		--exclude dev/ \
+		--exclude usr/lib/firmware/ \
+		--exclude var/cache/ \
+		--exclude var/spool/mail/ \
+		--exclude var/mail \
+		--progress || exit 2
+
+	du_sh=\$(du -sh /realroot${disk} | awk '{print \$1}')
+	n=\$(echo "\${du_sh%?} + $SIZE" | bc)
+	echo "Image size will be \$n"
+	d=\${du_sh: -1}
+
+	qemu-img create -f raw /realroot${rootfs} \${n}\${d} || exit 2
+	mkfs.ext4 /realroot${rootfs} || exit 2
+	mount /realroot${rootfs} /realroot${disk} || exit 2
+
+	rsync -a  /realroot/ /realroot${disk} \
+		--exclude .firecracker/ \
+		--exclude tmp/ \
+		--exclude mnt/ \
+		--exclude proc/ \
+		--exclude boot/ \
+		--exclude sys/ \
+		--exclude dev/ \
+		--exclude usr/lib/firmware/ \
+		--exclude var/cache/ \
+		--exclude var/spool/mail/ \
+		--exclude var/mail \
+		--progress || exit 2
+
+	mkdir -p /realroot${disk}/proc || return 2
+	mkdir -p /realroot${disk}/sys || return 2
+	mkdir -p /realroot${disk}/dev || return 2
+	mkdir -p /realroot${disk}/mnt || return 2
+	mkdir -p /realroot${disk}/var || return 2
+	mkdir -p /realroot${disk}/tmp || return 2
+	sync; sync
+	umount /realroot$disk || return 2
+	EOF
+
+	err "Building rootfs.ext4"
+	run chroot $tmproot sh /build || return 2
+	# echo "chroot $tmproot sh"
+
+	err "Writing rootfs.ext4 to $PWD"
+	run mv $rootfs rootfs.ext4 || return 2
+	EXIT_CODE=0
+	return 0
 }
 
-stage2() {
-	err "Running stage2"
-	# This stage runs insdie the target container chrooted
-	local rootfsimg=/mnt/rootfs.ext4
-	local disk=/tmp/disk
-	qemu-img create -f raw $rootfsimg $SIZE || return 2
-	mkfs.ext4 $rootfsimg || return 2
-	mkdir -p $disk || return 2
-	mount $rootfsimg $disk || return 2
-
-	rsync -a  /realroot $disk \
-		--exclude /realroot/tmp \
-		--exclude /realroot/mnt \
-		--exclude /realroot/proc \
-		--exclude /boot \
-		--exclude /sys \
-		--exclude /dev \
-		--exclude /usr/lib/firmware \
-		--exclude /var/cache \
-		--exclude /var/spool/mail \
-		--exclude /var/mail \
-		--progress > /tmp/rsync.log 2>&1 || return 2
-
-	umount $disk ||:
+run() {
+	local rc=0
+	local tmp=$(mktemp -d)
+	touch ${tmp}/std ${tmp}/err
+	$@ > ${tmp}/std 2> ${tmp}/err; rc=$?
+	echo "Command:$@" >> $LOG
+	echo "Returned: $rc" >> $LOG
+	echo "<STDOUT START>" >> $LOG
+	cat ${tmp}/std >> $LOG
+	echo "<STDOUT END>" >> $LOG
+	echo "<STDERR START>" >> $LOG
+	cat ${tmp}/err >> $LOG
+	echo "<STDERR END>" >> $LOG
+	rm -rf $tmp
+	return $rc
 }
 
-err() { echo "$@" 1>&2; }
+err() {
+	echo "$@" >> $LOG
+	echo "$@" 1>&2
+}
 
 main $@
