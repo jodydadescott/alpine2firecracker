@@ -9,7 +9,6 @@ This example uses the container alpine-firecracker-example1 which shoukd exist o
 
 The following commands should result in the creation of a file called rootfs.ext4 in your working directory,
 ```
-mkdir ~/firecrackerbuikld && cd ~/firecrackerbuikld 
 docker run --privileged -v $PWD:/mnt -it jodydadescott/alpine-firecracker-example1 sh
 wget https://raw.githubusercontent.com/jodydadescott/alpine2firecracker/master/alpine2firecracker
 sh alpine2firecracker
@@ -21,9 +20,6 @@ Now you are ready to run the image. The instructions below are based on the offi
 * A Linux bridge is configured for networking and named br0
 * A DHCP server is configured on the br0 subnet
 * You have a kernel which can be downloaded [here](https://github.com/jodydadescott/firecracker-kernel/releases/download/v4.16.0/vmlinuz-4.16)
-
-
-
 
 You will need to open two terminal windows. On one window run the commands
 ```
