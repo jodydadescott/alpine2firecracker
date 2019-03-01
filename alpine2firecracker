@@ -1,0 +1,76 @@
+#!/bin/sh -e
+
+export SIZE=200M
+
+main() {
+	[[ $FIRECRACKER_STAGE ]] && { $FIRECRACKER_STAGE; return $?; }
+	container=$1
+	[[ $container ]] || { err "Usage: $0 container (eg. jodydadescott/myfire:latest)"; return 2; }
+	docker run --privileged -e FIRECRACKER_STAGE=stage1 -v $(PWD):/mnt -it $container sh /mnt/$(basename $0)
+}
+
+stage1() {
+	# This stage runs inside the target container
+	err "Running stage1"
+	tmp=$(mktemp -d)
+	cd $tmp || return 2
+	tmproot=$tmp/tmproot
+	newroot=$tmp/newroot
+	mkdir -p $tmproot/realroot $tmproot/mnt || return 2
+
+	# Install minimum required packages
+	apk add alpine-base blkid syslinux util-linux e2fsprogs || return 2
+
+	ln -s /etc/init.d/agetty /etc/init.d/agetty.ttyS0 || return 2
+	ln -s /etc/init.d/devfs  /etc/runlevels/boot || return 2
+	ln -s /etc/init.d/hostname /etc/runlevels/boot || return 2
+	ln -s /etc/init.d/procfs /etc/runlevels/boot || return 2
+	ln -s /etc/init.d/sysfs  /etc/runlevels/boot || return 2
+	ln -s /etc/init.d/syslog /etc/runlevels/boot || return 2
+	ln -s /etc/init.d/agetty.ttyS0 /etc/runlevels/default || return 2
+
+	mkdir -p $tmproot/etc/apk || return 2
+	cp -r /etc/apk/keys ${tmproot}/etc/apk || return 2
+	install -D /etc/apk/repositories ${tmproot}/etc/apk/repositories || return 2
+	apk add --root $tmproot --initdb --quiet || return 2
+	apk add --root $tmproot --quiet alpine-base rsync qemu-img e2fsprogs || return 2
+
+	mount --bind / $tmproot/realroot || return 2
+	mount --bind /mnt $tmproot/mnt || return 2
+	mount --bind /proc $tmproot/proc || return 2
+	mount --bind /sys $tmproot/sys || return 2
+	mount --bind /dev $tmproot/dev || return 2
+
+	export FIRECRACKER_STAGE=stage2
+	chroot $tmproot sh /mnt/$(basename $0) || return 2
+}
+
+stage2() {
+	err "Running stage2"
+	# This stage runs insdie the target container chrooted
+	local rootfsimg=/mnt/rootfs.ext4
+	local disk=/tmp/disk
+	qemu-img create -f raw $rootfsimg $SIZE || return 2
+	mkfs.ext4 $rootfsimg || return 2
+	mkdir -p $disk || return 2
+	mount $rootfsimg $disk || return 2
+
+	rsync -a  /realroot $disk \
+		--exclude /realroot/tmp \
+		--exclude /realroot/mnt \
+		--exclude /realroot/proc \
+		--exclude /boot \
+		--exclude /sys \
+		--exclude /dev \
+		--exclude /usr/lib/firmware \
+		--exclude /var/cache \
+		--exclude /var/spool/mail \
+		--exclude /var/mail \
+		--progress > /tmp/rsync.log 2>&1 || return 2
+
+	umount $disk ||:
+}
+
+err() { echo "$@" 1>&2; }
+
+main $@
